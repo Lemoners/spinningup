@@ -83,9 +83,90 @@ class VPGBuffer:
                     adv=self.adv_buf, logp=self.logp_buf)
         return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
 
+# MCTS
+class Node:
+    """
+    Tree Node for MCTS
+    """
+    def __init__(self, parent=None, children=[]):
+        self.parent = parent
+        self.children = children
+        self.score = 0
+        self.visited_count = 0
+        self.leaf_node = False
+    
+    def update_score(self, s):
+        self.score = (self.score * self.visited_count + s) / (self.visited_count + 1) 
+        self.visited_count += 1
+
+    def get_score(self):
+        return self.score
+    
+    def is_leaf_node(self):
+        return leaf_node
+
+    def get_UCB_score(self, C=0.5):
+        return self.score + C * math.sqrt (math.log(self.parent.get_score()) / self.get_score())
+
+def random_evaluation(env, max_steps=1000):
+    actions = [i for i in range(env.action_space.n)]
+    done = False
+    r = 0.0
+    step = 0
+    while not done and (step < max_steps):
+        step += 1
+        a = np.random.randint(0, env.action_space.n)
+        _, r, done, _ = env.step(a)
+    return r
+
+def MCTS(env, search_count=1000, max_depth=5):
+    root = Node()
+    actions = [i for i in range(env.action_space.n)]
+    cur_search_count = 0
+    while(cur_search_count < search_count):
+        cur_search_count += 1
+
+        __env = env.copy()
+        cur_node = root
+        cur_depth = 1
+        
+        # Selection
+        while not cur_node.is_leaf_node() and (cur_depth < max_depth):
+            cur_depth += 1
+            if len(cur_node.children) < len(actions):
+                __node = Node(parent=cur_node)
+                cur_node.children.append(__node)
+
+                a = actions[len(cur_node.children)]
+                _, r, done, info = __env.step(a)
+                
+                cur_node = __node
+
+                if done:
+                    __node.leaf_node = True
+                    __node.score = r
+                if info.get('useless'):
+                    __node.leaf_node = True
+                    __node.score = -1.0
+            else:
+                # UCB
+                a = np.argmax([n.get_UCB_score() for n in cur_node.children])
+                __node = cur_node.children[a]
+                _, r, done, info = __env.step(a)
+                cur_node = __node
+            
+            # Back-propagation
+            if cur_node.is_leaf_node():
+                score = cur_node.get_score()
+            else:
+                score = random_evaluation(__env, max_steps=200)
+            while (cur_node != Node):
+                cur_node.update_score(score)
+                cur_node = cur_node.parent
+    return [n.get_score() for n in root.children]
 
 
-def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0, 
+def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, pi_lr=3e-4,
         vf_lr=1e-3, train_v_iters=80, lam=0.97, max_ep_len=1000,
         logger_kwargs=dict(), save_freq=10):
@@ -191,7 +272,8 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     # Instantiate environment
     env = env_fn()
     obs_dim = env.observation_space.shape
-    act_dim = env.action_space.shape
+    # Add for gym_minigrid
+    act_dim = env.action_space.shape or env.action_space.n
 
     # Create actor-critic module
     ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)

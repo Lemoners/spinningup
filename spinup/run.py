@@ -12,6 +12,7 @@ import tensorflow as tf
 import torch
 from copy import deepcopy
 from textwrap import dedent
+import gym_minigrid
 
 
 # Command line args that will go to ExperimentGrid.run, and must possess unique
