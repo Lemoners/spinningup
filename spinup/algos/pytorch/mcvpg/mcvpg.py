@@ -1,12 +1,40 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam
 import gym
 import time
-import spinup.algos.pytorch.vpg.core as core
+import spinup.algos.pytorch.mcvpg.core as core
 from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+
+from functools import reduce
+import operator
+
+
+class RecActBuffer:
+    def __init__(self, obs_dim, act_dim, size):
+        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        # Action recommended by MCTS
+        self.rec_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.ptr, self.max_size = 0, size
+
+    def store(self, obs, rec_act):
+        self.obs_buf[self.ptr] = obs
+        self.rec_buf[self.ptr] = rec_act
+        self.ptr += 1
+        self.ptr = self.ptr % self.max_size
+    
+    def get(self):
+        """
+        Call this at the end of an epoch to get all of the data from
+        the buffer, with advantages appropriately normalized (shifted to have
+        mean zero and std one). Also, resets some pointers in the buffer.
+        """
+        # the next two lines implement the advantage normalization trick
+        data = dict(obs=self.obs_buf, rec_act=self.rec_buf)
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
 
 
 class VPGBuffer:
@@ -79,91 +107,9 @@ class VPGBuffer:
         # the next two lines implement the advantage normalization trick
         adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
-        data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
-                    adv=self.adv_buf, logp=self.logp_buf)
+        data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf, adv=self.adv_buf, logp=self.logp_buf)
         return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
-
-# MCTS
-class Node:
-    """
-    Tree Node for MCTS
-    """
-    def __init__(self, parent=None, children=[]):
-        self.parent = parent
-        self.children = children
-        self.score = 0
-        self.visited_count = 0
-        self.leaf_node = False
-    
-    def update_score(self, s):
-        self.score = (self.score * self.visited_count + s) / (self.visited_count + 1) 
-        self.visited_count += 1
-
-    def get_score(self):
-        return self.score
-    
-    def is_leaf_node(self):
-        return leaf_node
-
-    def get_UCB_score(self, C=0.5):
-        return self.score + C * math.sqrt (math.log(self.parent.get_score()) / self.get_score())
-
-def random_evaluation(env, max_steps=1000):
-    actions = [i for i in range(env.action_space.n)]
-    done = False
-    r = 0.0
-    step = 0
-    while not done and (step < max_steps):
-        step += 1
-        a = np.random.randint(0, env.action_space.n)
-        _, r, done, _ = env.step(a)
-    return r
-
-def MCTS(env, search_count=1000, max_depth=5):
-    root = Node()
-    actions = [i for i in range(env.action_space.n)]
-    cur_search_count = 0
-    while(cur_search_count < search_count):
-        cur_search_count += 1
-
-        __env = env.copy()
-        cur_node = root
-        cur_depth = 1
         
-        # Selection
-        while not cur_node.is_leaf_node() and (cur_depth < max_depth):
-            cur_depth += 1
-            if len(cur_node.children) < len(actions):
-                __node = Node(parent=cur_node)
-                cur_node.children.append(__node)
-
-                a = actions[len(cur_node.children)]
-                _, r, done, info = __env.step(a)
-                
-                cur_node = __node
-
-                if done:
-                    __node.leaf_node = True
-                    __node.score = r
-                if info.get('useless'):
-                    __node.leaf_node = True
-                    __node.score = -1.0
-            else:
-                # UCB
-                a = np.argmax([n.get_UCB_score() for n in cur_node.children])
-                __node = cur_node.children[a]
-                _, r, done, info = __env.step(a)
-                cur_node = __node
-            
-            # Back-propagation
-            if cur_node.is_leaf_node():
-                score = cur_node.get_score()
-            else:
-                score = random_evaluation(__env, max_steps=200)
-            while (cur_node != Node):
-                cur_node.update_score(score)
-                cur_node = cur_node.parent
-    return [n.get_score() for n in root.children]
 
 
 def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0, 
@@ -271,12 +217,12 @@ def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
 
     # Instantiate environment
     env = env_fn()
-    obs_dim = env.observation_space.shape
-    # Add for gym_minigrid
-    act_dim = env.action_space.shape or env.action_space.n
+
+    obs_dim = reduce(operator.mul, env.observation_space.shape, 1)
+    act_dim = env.action_space.shape
 
     # Create actor-critic module
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac = actor_critic(obs_dim, env.action_space, **ac_kwargs)
 
     # Sync params across processes
     sync_params(ac)
@@ -288,6 +234,7 @@ def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
     buf = VPGBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
+    rec_act_buf = RecActBuffer(obs_dim, act_dim, local_steps_per_epoch)
 
     # Set up function for computing VPG policy loss
     def compute_loss_pi(data):
@@ -304,6 +251,14 @@ def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
 
         return loss_pi, pi_info
 
+    def compute_action_guide_loss_pi(data):
+        obs, rec_act = data['obs'], data['rec_act']
+        rec_act = rec_act.to(torch.long)
+        pi = ac.pi._distribution(obs)
+        # Action-guide loss
+        ag_loss = F.cross_entropy(pi.probs, rec_act, reduce="mean")
+        return ag_loss
+
     # Set up function for computing value loss
     def compute_loss_v(data):
         obs, ret = data['obs'], data['ret']
@@ -318,6 +273,7 @@ def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
 
     def update():
         data = buf.get()
+        rec_act_data = rec_act_buf.get()
 
         # Get loss and info values before update
         pi_l_old, pi_info_old = compute_loss_pi(data)
@@ -327,6 +283,7 @@ def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
         # Train policy with a single step of gradient descent
         pi_optimizer.zero_grad()
         loss_pi, pi_info = compute_loss_pi(data)
+        loss_pi = loss_pi + 0.5 * compute_action_guide_loss_pi(rec_act_data)
         loss_pi.backward()
         mpi_avg_grads(ac.pi)    # average grads across MPI processes
         pi_optimizer.step()
@@ -354,6 +311,11 @@ def mcvpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
             a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            
+            # 10% prob: MCTS rec_act
+            if np.random.randint(100) < 1: 
+                rec_a = core.Node.MCTS(env, search_count=200, max_depth=6)
+                rec_act_buf.store(o, rec_a)
 
             next_o, r, d, _ = env.step(a)
             ep_ret += r

@@ -10,6 +10,9 @@ from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_sc
 import gym_minigrid
 from gym_minigrid.wrappers import FullyObsWrapper, ImgObsWrapper, FlatObsWrapper
 
+import operator
+from functools import reduce
+
 class VPGBuffer:
     """
     A buffer for storing trajectories experienced by a VPG agent interacting
@@ -192,14 +195,12 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     # Instantiate environment
     env = env_fn()
 
-    if isinstance(env, gym_minigrid.envs.crossing.LavaCrossingS9N2Env):
-        env = FlatObsWrapper(FullyObsWrapper(env))
-
-    obs_dim = env.observation_space.shape
+    
+    obs_dim = reduce(operator.mul, env.observation_space.shape, 1)
     act_dim = env.action_space.shape
 
     # Create actor-critic module
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac = actor_critic(obs_dim, env.action_space, **ac_kwargs)
 
     # Sync params across processes
     sync_params(ac)
@@ -273,6 +274,7 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     start_time = time.time()
     o, ep_ret, ep_len = env.reset(), 0, 0
 
+
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
@@ -293,6 +295,7 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
             terminal = d or timeout
             epoch_ended = t==local_steps_per_epoch-1
 
+            
             if terminal or epoch_ended:
                 if epoch_ended and not(terminal):
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)

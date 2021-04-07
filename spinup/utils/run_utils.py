@@ -19,6 +19,7 @@ from textwrap import dedent
 import time
 from tqdm import trange
 import zlib
+from gym_minigrid.wrappers import FlatFullyObsWrapper
 
 DIV_LINE_WIDTH = 80
 
@@ -152,7 +153,12 @@ def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
         if 'env_name' in kwargs:
             import gym
             env_name = kwargs['env_name']
-            kwargs['env_fn'] = lambda : gym.make(env_name)
+
+            if ('LavaCrossingS9N2' in env_name):
+                kwargs['env_fn'] = lambda : FlatFullyObsWrapper(gym.make(env_name))
+            else:
+                kwargs['env_fn'] = lambda : gym.make(env_name)
+            
             del kwargs['env_name']
 
         # Fork into multiple processes
